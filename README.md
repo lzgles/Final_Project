@@ -1,6 +1,6 @@
 Foundations of R for Data Analysis
 Final Project
-Laura Zglesewski
+Laura Zgleszewski
 Fall 2021
 
 This repository is from a study on legacy sediments conducted on the Big Elk 
