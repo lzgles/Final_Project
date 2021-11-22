@@ -1,0 +1,441 @@
+---
+title: "Foundations of R for Data Analysis - Final Project"
+author: "Laura Zgleszewski"
+date: "11/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+# Legacy Sediment Analysis
+
+This repository is from a study on legacy sediments conducted in eastern Maryland, southeastern PA, and northern Delaware. From the 17th to the 19th century, settlers constructed mill dams which accumulated deposits of fine sediments that entered the watershed as a result of deforestation and agriculture practices. When these dams are removed, sediment is released into streams by erosion processes and can affect the water quality in a number of ways.  
+
+Legacy sediment deposits contain both fine and coarse particles that can increase water turbidity. They may contain heavy metal deposits from local industries or increased nutrient concentrations from agriculture. They contain diverse microbial communities, some of which play an active role in nutrient cycling. The goal of the study was to examine the microbial community and determine nutrient and heavy metal content of legacy sediments to gain insight into the effects on water quality as the sediment deposits erode into streams.
+
+
+
+Libraries & Themes
+
+```{r}
+library(tidyverse)
+library(leaflet)
+library(janitor)
+library(viridis)
+library(fuzzyjoin)
+library(vegan)
+library(plotly)
+library(grid)
+theme_set(theme_minimal())
+```
+
+# Project Data
+
+To read in the data:
+
+```{r}
+coordinates <- read_csv("Data/Site_Coordinates.csv")
+sediment <- read_csv("Data/Sediment_Characteristics.csv")
+microbes <- read_csv("Data/Microbial_Community.csv")
+```
+
+I will begin with a quick look at the structure of the data.
+
+```{r}
+glimpse(coordinates)
+glimpse(sediment)
+glimpse(microbes)
+```
+
+
+The data set is made up of three files. 'Coordinates' is the latitude, longitude, and land-use type of the sample sites. 'Sediment' includes the characteristics of the samples including chemistry, depth, particle size, and other parameters. 'Microbes' is a table of DNA sequences, the taxonomy of the sequences, and the count of each sequence in each sample.
+
+I will do a clean up on the column names to make things easier later.
+
+```{r}
+coordinates <- clean_names(coordinates)
+sediment <- clean_names(sediment)
+microbes <- clean_names(microbes)
+```
+
+
+# Sample Sites
+
+I will start with a look at where the sample sites are located. Sites represent different land-use types: urban (red), suburban (blue), agriculture (yellow), or forested (green). 
+
+```{r}
+coordinates %>%
+  leaflet() %>%
+  setView(-75.6, 39.6, 9.5) %>%
+  addProviderTiles(providers$Stamen.Terrain) %>%
+  addCircleMarkers(lng = ~long,
+                   lat = ~lat,
+                   weight = .5,
+                   stroke = F,
+                   fill = T,
+                   fillOpacity = .8,
+                   fillColor = c("red", 
+                                 "green", 
+                                 "yellow", 
+                                 "red", 
+                                 "yellow",
+                                 "yellow",
+                                 "red",
+                                 "blue",
+                                 "red",
+                                 "blue",
+                                 "blue", 
+                                 "green",
+                                 "yellow",
+                                 "yellow",
+                                 "yellow"))
+```
+
+Each site contains a deposit of legacy sediment. When the structures containing these sediments are removed, stream water begins to erode the sediment, releasing it into the watershed and leaving behind a tall, steep bank like this one at the Scott's Mill site. Here you can also see the remnants of the mill dam. 
+
+
+```{r}
+knitr::include_graphics("ScottsMill.jpg")
+```
+
+
+At each sample site, cores were collected at various depths in the legacy sediment. Each sample represents one core at one depth. At least three cores were taken at each site.  
+
+```{r}
+summary(sediment)
+```
+
+
+Depths ranged from 12 inches at the shallowest to 156 inches at the deepest. These cores were analyzed for various chemical, physical, and genetic parameters. 
+
+# Microbial Community Data
+
+The sediment core samples contain millions of microbes, each containing a DNA sequence. This genetic material is analyzed by high throughput sequencing which produces tens of thousands of DNA sequences. While this covers only a portion of the total microbial DNA, it is considered representative of the microbial community and allows for comparisons among samples. The 'microbes' table includes these sequences and the number present in each sample. It also includes the taxonomy of the sequences, identified by comparing sequences to a database of previously identified sequences provided by the Ribosomal Database Project.
+
+Some sequences cannot be identified, and some can only be identified to a certain taxonomic level. For example, a sequence may be a close enough match to the database to identify its family but not its genus. Unidentified taxonomic levels are denoted as NA.
+
+```{r}
+microbes %>%
+  summarize(across(everything(), ~sum(is.na(.))))
+```
+Notice that the number of NAs increases with each taxonomic level. Also, the taxonomic identification stops at the genus level rather than attempting to identify the species of the sequences.   
+
+
+To organize the table, I will arrange it by the most abundant sequences. I also want to remove sequences that do not have an identified kingdom or phylum. I will also remove chloroplasts which are an artifact and should not be included in analyses. I will also remove rows with a zero total that are present because this table was originally part of larger project. In addition, some of the column names are R functions, so I will add a _m (for microbes) suffix 
+```{r}
+microbes_clean <- 
+microbes %>%
+  rename("class_m" = "class", "order_m" = "order", "family_m" = "family") %>%
+  mutate(total = rowSums(.[8:75])) %>%
+  filter(kingdom != is.na(kingdom),
+         phylum != is.na(phylum),
+         !(class_m %in% "Chloroplast"),
+         total > 0) %>%
+  arrange(desc(total))
+```
+
+
+One way of looking at a microbial community is species richness, the total number of species in each sample. This will give you an idea of the range of microbial diversity across sites. For this calculation, I will count each sequence in the microbes table as a different species. (In reality, the same species might be represented multiple times in the table, with slight differences between the sequences).
+
+```{r}
+microbes_clean %>%
+  summarise(across(c(8:75), ~sum(as.numeric(.x != 0)))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "sample_name",
+               values_to = "richness") %>%
+  ggplot(aes(x = richness,
+             y = reorder(sample_name, richness))) + 
+  geom_bar(stat = "identity", fill = "#00C1AA", color = "black") + 
+  labs(x = "Species Richness",
+       y = "Sample Name")
+```
+
+
+I will determine which are the most abundant phyla, and see how they compare across samples. I will collapse the sequences into phyla then graph the phyla table to observe the abundance.   
+
+```{r}
+# Collapse sequences into phyla
+phylum_df <- 
+microbes_clean %>%
+  group_by(phylum) %>%
+  summarize(across(where(is.double), ~sum(.))) %>%
+  ungroup() %>%
+  arrange(desc(total))
+
+# Graph the phyla
+
+phylum_df %>%
+  select(phylum, total) %>%
+  ggplot(aes(x = total,
+             y = reorder(phylum, total))) + 
+  geom_col() +
+  labs(x = "Total Sequences",
+       y = "Phylum")
+```
+
+
+I will take a look at how the proportions of the top ten most abundant phyla vary in different samples. 
+
+```{r}
+# Select phyla with >= 50000 sequences
+
+phylum_top <- 
+phylum_df %>%
+  filter(total >= 50000)
+
+# Reorganize table
+
+phylum_top_long <- 
+phylum_top %>%
+  pivot_longer(!phylum,
+               names_to = "sample_name",
+               values_to = "count_of_seq"
+               ) %>%
+  mutate(sample_name = str_replace_all(string = c(.$sample_name),
+                                       pattern = "sm2",
+                                       replacement = "smtwo")) %>%
+  separate(col = sample_name,
+           into = c("site_abbreviation"),
+           sep = "\\d",
+           remove = F) %>%
+  mutate(site_abbreviation = toupper(site_abbreviation)) %>%
+  mutate(site_abbreviation = str_replace_all(string = c(.$site_abbreviation),
+                                       pattern = "SM",
+                                       replacement = "SM3")) %>%
+  mutate(site_abbreviation = str_replace_all(string = c(.$site_abbreviation),
+                                       pattern = "SM3TWO_",
+                                       replacement = "SM2")) %>%
+  mutate(sample_name = str_replace_all(string = c(sample_name),
+                                       pattern = "smtwo",
+                                       replacement = "sm2")) %>%
+  mutate(site_abbreviation = str_remove_all(string = c(site_abbreviation),
+                                       pattern = "_"))
+
+
+# Graph phyla by sample
+
+phylum_top_long %>%
+  ggplot(aes(fill = phylum,
+             y = count_of_seq,
+             x = sample_name)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  labs(y = "Proportion of Phylum",
+       x = "Sample Name") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  scale_fill_viridis_d()
+```
+
+
+Acidobacteria and Proteobacteria are the dominant phyla across all samples. Acidobacteria are typically known to be prevalent and often dominant in soils. Proteobacteria is a diverse group that includes bacteria involved in nitrogen cycling, including nitrogen-fixing and ammonia-oxidizing. I will take a look at these and some other highly abundant phyla in comparison to sediment parameters later.  
+
+# Sediment Characteristics
+
+To begin examining sediment parameters, I need to join the tables. 
+
+```{r}
+sed_joined <- 
+sediment %>%
+  separate(col = sample_name,
+           into = "site_abbreviation",
+           sep = "_",
+           remove = F) %>%
+  full_join(
+    x = .,
+    y = coordinates,
+    by = c("site_abbreviation" = "site_abbreviation")
+  )
+```
+
+
+There are too many parameters to compare all combinations of them. Instead, I am most interested in how each parameter varies by land use and depth. I will look first at the parameters at each site, and for each land use type. 
+
+```{r}
+sed_sl <-
+sed_joined %>%
+  select("site_name", "land_use") 
+
+sed_sl <-
+  colnames(sed_sl) 
+
+sed_continuous <-
+sed_joined %>%
+  select(-"sample_name", -"site_abbreviation", -"classification", -"site_name", -"land_use", -"lat", -"long") 
+
+sed_continuous <- 
+  colnames(sed_continuous)
+
+sed_combos <- 
+  expand_grid(field_1 = sed_sl,
+              field_2 = sed_continuous)
+
+map2(.x = sed_combos$field_1,
+     .y = sed_combos$field_2, 
+     ~ sed_joined %>%
+       ggplot(aes(x = .data[[.x]],
+                  y = .data[[.y]],
+                  color = land_use)) +
+       geom_boxplot() +
+       theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+)
+```
+
+
+A few interesting patterns can be observed. Urban land use showed higher levels of several heavy metals including iron (fe), zinc (zn), copper (cu), cadmium, (cd), chromium (cr), lead (pb), and nickel (ni). The site near the Brandywine Zoo, an urban site, showed noticeably high levels of phosphorus (p), calcium (ca), copper (cu), boron (b), silicon (si), cadmium (cd), lead (pb), and nickel (ni). Other high parameters included potassium (k) at Tweedes Mill and sulfur (s) at Woolen Mill. The chemical levels at urban sites may have been influenced by current or historical industry. The BZ site is downstream of the Dupont Experimental Station and former gunpowder mills, while Woolen Mill is located near a former paper mill.   
+
+I am also interested in how these parameters vary by depth. 
+
+```{r}
+sed_combos_d <- 
+  expand_grid(field_1 = "bank_depth_in",
+              field_2 = sed_continuous)
+
+map2(.x = sed_combos_d$field_1,
+     .y = sed_combos_d$field_2, 
+     ~ sed_joined %>%
+       ggplot(aes(x = .data[[.x]],
+                  y = .data[[.y]])) +
+       geom_point() +
+       geom_smooth() +
+       theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+)
+```
+
+
+Depth appears to have very little impact on any of the measured parameters, with the possible exception of the number of denitrifying bacteria in the sediment. To take a closer look, I will split up the land use.   
+
+
+```{r}
+sed_joined %>%
+  ggplot(aes(x = bank_depth_in,
+             y = dentrifier_copy_number_total_nos_z_copy_number_g_soil,
+             color = land_use)) +
+       geom_point() +
+       geom_smooth() +
+       theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+Some of the agricultural sites have higher denitrifying bacteria in deeper soils, but it is not a strong trend.
+
+# Microbial Community and Sediment Characteristics
+
+To make comparisons among the microbial community and sediment parameters, I will join the tables and remove a few resulting NAs - either from sequencing samples that did not work but have sediment data, or from replicate sequencing samples that do not have sediment data. 
+
+```{r}
+phylum_top_long <- 
+phylum_top_long %>%
+  mutate(sample_name = toupper(sample_name))
+
+phylum_sed <- 
+full_join(x = phylum_top_long,
+          y = sed_joined,
+          by = c("sample_name" = "sample_name")) %>%
+filter(phylum != is.na(phylum),
+         site_abbreviation.y != is.na(site_abbreviation.y))
+```
+
+I will see if there are any interesting trends in the microbial community related to depth. 
+
+```{r}
+phylum_sed %>%
+  mutate(bank_depth_in_c = as.character(bank_depth_in)) %>%
+  mutate(bank_depth_in_c = fct_reorder(bank_depth_in_c, bank_depth_in)) %>%
+  ggplot(aes(fill = phylum,
+             y = count_of_seq,
+             x = bank_depth_in_c)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  labs(y = "Proportion of Phylum",
+       x = "Bank Depth(in)") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  scale_fill_viridis_d()
+```
+
+
+As with the sediment parameters, there does not appear to be a trend related to depth. 
+
+Does the community differ in the various land uses?
+
+```{r}
+phylum_sed %>%
+  ggplot(aes(fill = phylum,
+             y = count_of_seq,
+             x = land_use)) + 
+  geom_bar(position = "fill", stat = "identity") + 
+  labs(y = "Proportion of Phylum",
+       x = "Land Use") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  scale_fill_viridis_d()
+```
+
+Land use also does not show a trend. 
+
+# A better way to explore the microbial community
+
+Bivariate analyses may be limited in their ability to show trends in the microbial community due to the size and diversity of the data set. A better way to make comparisons is to use non-metric multidimensional scaling, or NMDS. In this type of plot, samples are grouped based on their similarity. Samples with microbial communities that are highly similar will group together tightly, while samples with different communities will spread farther apart. First, I need to arrange the two data frames to match exactly, then run and plot the NMDS.  
+
+```{r}
+microbes_nmds <- 
+microbes_clean %>%
+  select(where(is.double), -"total") %>%
+  select(!contains("rep"))
+  
+  
+sed_joined_nmds <- 
+sed_joined %>%
+  filter(!(sample_name %in% c("BEB_48", "SM2_72", "SM2_88"))) %>%
+  arrange(sample_name)
+
+set.seed(1234)
+NMDS <- metaMDS(t(microbes_nmds), distance = "bray", k = 3, maxit = 999, trymax = 100, wascores = TRUE)
+NMDS$stress
+nmds_scores <- as.data.frame(scores(NMDS))
+nmds_scores$sample_name <- rownames(nmds_scores)
+nmds_scores$Type <- c(sed_joined_nmds$land_use)
+ggplot() + 
+  geom_point(data=nmds_scores,aes(x=NMDS1,y=NMDS2, shape=Type, color=Type),size=3) + 
+  geom_text(data=nmds_scores,aes(x=NMDS1,y=NMDS2,label=sample_name),size=2,vjust=0, hjust=-.1) +  
+  coord_fixed() +
+  scale_shape_manual(values=c(15, 15, 15, 15)) +
+  scale_color_manual(values=c("yellow", "green", "blue", "red")) +
+  labs(caption = "Stress Value = 0.1323153")
+```
+
+
+Here I can see some more interesting trends than with the phylum graphs. Agriculture, Forested, and Suburban sites are generally similar to each other and group together on the graph. Urban sites are more different. The Brandywine Zoo and Cooches Bridge fall away from the other samples, although surprisingly, some of the Tweedes Mill sites appear to be similar to the Brandywine. The stress value is an indicator of the reliability of the NMDS plot. Values less than 0.2 are acceptable and the lower the value, the more reliable the plot.     
+
+The plot above shows two of the NMDS axes. NMDS plots can make use of three or more axes. I can use plotly to construct a 3D version of the NMDS and color it by land use. 
+
+```{r}
+plot_ly(x=nmds_scores[,1], y=nmds_scores[,2], z=nmds_scores[,3], type="scatter3d", mode="markers", color=sed_joined_nmds$land_use, colors=c("yellow", "green","blue", "red"))
+```
+
+
+To get a clearer picture of how the sediment characteristics influence the microbial community, I can fit them as vectors onto the NMDS. The longer the vector arrow, the more the pattern of the NMDS plot is driven by that parameter. 
+
+
+```{r}
+sed_vectors <- 
+sed_joined_nmds %>%
+  select(-sample_name, -site_abbreviation, -site_name, -lat, -long) %>%
+  select(-c(total_depth_in:percent_fine))
+
+vectors_nmds <- envfit(NMDS, sed_vectors)
+
+plot(NMDS, type = "n")
+points(x = nmds_scores$NMDS1, y = nmds_scores$NMDS2, pch=15, col=c("Agriculture" = "yellow", "Forested" = "green", "Suburban" = "blue", "Urban" = "red")[sed_joined_nmds$land_use]) 
+plot(vectors_nmds, col="black", p.max=0.05, cex = 0.75)
+
+
+```
+
+
+Layering the vectors makes it more clear that the pattern of the Urban samples is influenced by the concentrations of metals as well as nitrogen and nitrifying bacteria. Carbon and aluminum are also driving other aspects of the pattern for other land use types.   
+
+# Conclusions
+
+These data suggest that legacy sediments could have a variety of impacts on stream ecosystems. Microbial communities vary by location and land use. Nitrifying and denitrifying microbes are abundant in legacy sediments. These microbes play an important role in nutrient cycling, and could affect nitrogen levels in streams as they move between sediment deposits and water. Metals and nutrients are observed in sediments and in addition to their effect on microbial community composition, their presence is a concern for water quality. Further exploration into the interaction between microbes and nutrients in legacy sediments could be beneficial to future dam removal plans.  
